@@ -182,6 +182,21 @@
     color: #9ca3af;
   }
 
+  .error-box {
+    display: none;
+    margin-top: 1rem;
+    background: rgba(239,68,68,0.12);
+    border: 1px solid rgba(239,68,68,0.4);
+    border-radius: 12px;
+    padding: 1rem 1.25rem;
+    color: #fca5a5;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    word-break: break-all;
+  }
+  .error-box.show { display: block; }
+  .error-box strong { display: block; margin-bottom: 0.25rem; color: #f87171; }
+
   /* Result */
   .result-section {
     display: none;
@@ -279,6 +294,10 @@
       <div class="progress-bar" id="progressBar"></div>
     </div>
     <div class="progress-text" id="progressText">正在加载 FFmpeg …</div>
+    <div class="error-box" id="errorBox">
+      <strong>出错了</strong>
+      <span id="errorMsg"></span>
+    </div>
   </div>
 
   <!-- Result -->
@@ -303,6 +322,7 @@ const $ = id => document.getElementById(id);
 let file1 = null, file2 = null;
 let ffmpeg = null;
 let mergedBlob = null;
+let ffmpegLogs = [];
 
 // DOM refs
 const input1 = $('input1'), input2 = $('input2');
@@ -311,7 +331,20 @@ const name1 = $('name1'), name2 = $('name2');
 const card1 = $('card1'), card2 = $('card2');
 const mergeBtn = $('mergeBtn'), resetBtn = $('resetBtn');
 const progressWrap = $('progressWrap'), progressBar = $('progressBar'), progressText = $('progressText');
+const errorBox = $('errorBox'), errorMsg = $('errorMsg');
 const resultSection = $('resultSection'), resultVideo = $('resultVideo'), downloadBtn = $('downloadBtn');
+
+function showError(msg, detail = '') {
+  progressBar.style.width = '0%';
+  progressText.textContent = '处理失败';
+  errorBox.classList.add('show');
+  errorMsg.textContent = msg + (detail ? '\n\n详细日志：' + detail : '');
+}
+
+function hideError() {
+  errorBox.classList.remove('show');
+  errorMsg.textContent = '';
+}
 
 function updateMergeBtn() {
   mergeBtn.disabled = !(file1 && file2);
@@ -398,35 +431,63 @@ resetBtn.addEventListener('click', () => {
   resultSection.classList.remove('show');
   progressWrap.classList.remove('show');
   progressBar.style.width = '0%';
+  hideError();
   updateMergeBtn();
 });
 
 // Load FFmpeg
 async function loadFFmpeg() {
-  if (ffmpeg) return ffmpeg;
+  if (ffmpeg && ffmpeg.loaded) return ffmpeg;
+
   ffmpeg = new FFmpeg();
+  ffmpegLogs = [];
 
   ffmpeg.on('progress', ({ progress }) => {
-    const pct = Math.round(progress * 100);
-    progressBar.style.width = pct + '%';
-    progressText.textContent = `正在处理… ${pct}%`;
+    if (progress > 0) {
+      const pct = Math.min(Math.round(progress * 100), 99);
+      progressBar.style.width = (20 + pct * 0.75) + '%';
+      progressText.textContent = `正在拼接… ${pct}%`;
+    }
   });
 
   ffmpeg.on('log', ({ message }) => {
     console.log('[ffmpeg]', message);
+    ffmpegLogs.push(message);
   });
 
   progressWrap.classList.add('show');
-  progressText.textContent = '正在加载 FFmpeg 核心（首次加载较慢）…';
-  progressBar.style.width = '0%';
+  progressText.textContent = '正在加载 FFmpeg 核心（首次约需 10-30 秒）…';
+  progressBar.style.width = '5%';
 
-  const baseURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm';
-  await ffmpeg.load({
-    coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-  });
+  // Try jsdelivr CDN first, fallback to unpkg
+  const cdnList = [
+    'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.10/dist/esm',
+    'https://unpkg.com/@ffmpeg/core@0.12.10/dist/esm',
+  ];
 
+  let loaded = false;
+  for (const baseURL of cdnList) {
+    try {
+      progressText.textContent = `正在从 ${baseURL.includes('jsdelivr') ? 'jsdelivr' : 'unpkg'} 加载…`;
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      });
+      ffmpeg.loaded = true;
+      loaded = true;
+      break;
+    } catch (e) {
+      console.warn('CDN failed:', baseURL, e);
+    }
+  }
+
+  if (!loaded) throw new Error('无法加载 FFmpeg 核心，请检查网络连接后重试。');
   return ffmpeg;
+}
+
+// Get file extension
+function ext(file) {
+  return file.name.split('.').pop().toLowerCase() || 'mp4';
 }
 
 // Merge
@@ -434,37 +495,65 @@ mergeBtn.addEventListener('click', async () => {
   if (!file1 || !file2) return;
   mergeBtn.disabled = true;
   resultSection.classList.remove('show');
+  hideError();
+  ffmpegLogs = [];
 
   try {
     const ff = await loadFFmpeg();
 
-    progressText.textContent = '正在写入视频文件…';
+    progressText.textContent = '正在读取视频文件…';
     progressBar.style.width = '10%';
 
-    await ff.writeFile('input1.mp4', await fetchFile(file1));
-    await ff.writeFile('input2.mp4', await fetchFile(file2));
+    const e1 = ext(file1), e2 = ext(file2);
+    const in1 = `input1.${e1}`, in2 = `input2.${e2}`;
 
-    // Create concat list
-    await ff.writeFile('list.txt', 'file input1.mp4\nfile input2.mp4\n');
+    await ff.writeFile(in1, await fetchFile(file1));
+    progressBar.style.width = '13%';
+    await ff.writeFile(in2, await fetchFile(file2));
+    progressBar.style.width = '16%';
 
+    // Use filter_complex concat to handle different resolutions/codecs robustly
     progressText.textContent = '正在拼接视频…';
     progressBar.style.width = '20%';
 
-    // Re-encode to ensure compatibility
-    await ff.exec([
-      '-f', 'concat', '-safe', '0', '-i', 'list.txt',
-      '-c:v', 'libx264', '-preset', 'fast',
-      '-c:a', 'aac',
+    const ret = await ff.exec([
+      '-i', in1, '-i', in2,
+      '-filter_complex',
+      '[0:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v0];' +
+      '[1:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v1];' +
+      '[0:a:0]aresample=44100[a0];[1:a:0]aresample=44100[a1];' +
+      '[v0][a0][v1][a1]concat=n=2:v=1:a=1[vout][aout]',
+      '-map', '[vout]', '-map', '[aout]',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+      '-c:a', 'aac', '-b:a', '128k',
       '-movflags', '+faststart',
-      'output.mp4'
+      '-y', 'output.mp4'
     ]);
 
+    if (ret !== 0) {
+      // Fallback: try simple concat (works when both videos have same codec/resolution)
+      progressText.textContent = '尝试备用方案…';
+      await ff.writeFile('list.txt', `file ${in1}\nfile ${in2}\n`);
+      const ret2 = await ff.exec([
+        '-f', 'concat', '-safe', '0', '-i', 'list.txt',
+        '-c:v', 'libx264', '-preset', 'ultrafast',
+        '-c:a', 'aac',
+        '-movflags', '+faststart',
+        '-y', 'output.mp4'
+      ]);
+      if (ret2 !== 0) {
+        const lastLogs = ffmpegLogs.slice(-8).join('\n');
+        throw new Error(`FFmpeg 返回错误码 ${ret2}。\n\n最近日志：\n${lastLogs}`);
+      }
+    }
+
     progressText.textContent = '正在读取输出…';
-    progressBar.style.width = '95%';
+    progressBar.style.width = '97%';
 
     const data = await ff.readFile('output.mp4');
-    mergedBlob = new Blob([data.buffer], { type: 'video/mp4' });
+    if (!data || data.length === 0) throw new Error('输出文件为空，合并失败。');
 
+    mergedBlob = new Blob([data.buffer], { type: 'video/mp4' });
     const url = URL.createObjectURL(mergedBlob);
     resultVideo.src = url;
     resultVideo.style.display = '';
@@ -473,14 +562,14 @@ mergeBtn.addEventListener('click', async () => {
     progressBar.style.width = '100%';
     progressText.textContent = '拼接完成！';
 
-    // Cleanup
-    await ff.deleteFile('input1.mp4');
-    await ff.deleteFile('input2.mp4');
-    await ff.deleteFile('list.txt');
-    await ff.deleteFile('output.mp4');
+    // Cleanup (best-effort)
+    for (const f of [in1, in2, 'list.txt', 'output.mp4']) {
+      try { await ff.deleteFile(f); } catch (_) {}
+    }
+
   } catch (err) {
     console.error(err);
-    progressText.textContent = '出错了：' + err.message;
+    showError(err.message || String(err));
   } finally {
     mergeBtn.disabled = false;
     updateMergeBtn();
